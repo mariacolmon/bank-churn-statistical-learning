@@ -1,0 +1,1030 @@
+---
+title: "Bank Customer Churn: Handling Imbalanced Data and Threshold Optimization"
+author: "María Colado Montañés and Luis Calderón Yunda"
+output:
+  html_document:
+    theme: cosmo
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+
+library(janitor)
+library(naivebayes)
+library(tidymodels)
+library(ggcorrplot)
+library(discrim)   # LDA/QDA in tidymodels
+library(klaR)      # Naive Bayes engine
+library(pROC) 
+library(caret)
+library(MASS)      # For LDA and QDA
+library(ROSE)
+library(patchwork)
+library(tidyverse)
+set.seed(123)
+
+# Ensure "Yes" is the positive class in metrics like sens/precision/recall
+options(yardstick.event_first = FALSE)
+```
+
+# Introduction
+
+For this project, we selected the [Bank Customer Churn](https://www.kaggle.com/datasets/radheshyamkollipara/bank-customer-churn) dataset from Kaggle. Our aim is to analyse which factors are associated with a client deciding to stay in the bank or on the contrary closing their account.
+
+This dataset includes **demographic variables** (e.g., age, gender, and country), **bank relationship variables** (years as a customer, number of products, credit card ownership, and activity level), and **financial indicators** (credit score, account balance, and estimated salary). In addition, it also includes some relevant **customer experience information**, such as whether the customer has filed a complaint, (which should be interpreted with caution, as we will see later), their satisfaction score after and the type of card they hold.
+
+The **target variable** is Exited, which indicates whether the customer left the bank, therefore, this is a binary classification problem. The dataset also contains purely **identifying fields** such as *RowNumber*, *CustomerId*, and *Surname*, which are useful for record tracking but won't be taken into account for our analysis.
+
+It is worth mentioning that in the real world scenarios, **retaining customers is typically more cost-effective than acquiring new ones**. Thus, we will try to prioritize models that detect potential churners and highlight the key churn drivers, in order to guide targeted retention and loyalty campaigns.
+
+```{r load-eda-data, echo = FALSE}
+# Using relative path for reproducibility
+df_raw_eda <- read.csv("Customer-Churn-Records.csv")
+
+df_eda <- df_raw_eda
+
+drop_cols <- c("RowNumber","Surname","CustomerId")
+for (col in drop_cols) {
+  df_eda[[col]] <- NULL
+}
+
+quant_vars <- c("Age", "Balance", "CreditScore","EstimatedSalary","Point.Earned")
+categorical_ord <- c("Tenure","NumOfProducts","HasCrCard","IsActiveMember","Complain","Satisfaction.Score")
+categorical_nom <- c("Geography", "Gender", "Card.Type")
+
+for (col in categorical_ord) {
+  df_eda[[col]] <- as.factor(df_eda[[col]])
+}
+
+# Binary factor conversions
+df_eda$HasCrCard <- factor(df_eda$HasCrCard, levels = c(0, 1), labels = c("No", "Yes"))
+df_eda$IsActiveMember <- factor(df_eda$IsActiveMember, levels = c(0,1), labels = c("No", "Yes"))
+df_eda$Complain <- factor(df_eda$Complain, levels = c(0,1), labels = c("No", "Yes"))
+df_eda$Exited <- factor(df_eda$Exited, levels = c(0,1), labels = c("No", "Yes"))
+
+for (col in categorical_nom) {
+  df_eda[[col]] <- as.factor(df_eda[[col]])
+}
+
+# Corporate colors
+my_colors <- c("No" = "#00BFFF", "Yes" = "#FF7F50")
+```
+
+# Exploratory Data Analysis
+
+Let's first study the distribution of the target variable **Exited**, which is clearly **imbalanced**: around *79.6%* of customers did not leave the bank and only *20.4%* churned. Because of this imbalance, **accuracy is not a reliable metric**. For example: a *dummy model that predicts No for everyone* would already achieve about 79.6% accuracy while failing to identify most churners.
+
+For this reason, it is better to focus on metrics that reflect performance on the churn class and, if needed, explore resampling techniques to address the class imbalance. No duplicates clients neither missing values were found in this dataset.
+
+```{r plot-target-dist, echo = FALSE}
+df_eda %>%
+  count(Exited) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(x = factor(Exited), y = n, fill = factor(Exited))) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(
+    aes(label = percent(pct, accuracy = 0.1)),
+    vjust = -0.4,
+    size = 4,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = my_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "Target variable distribution",
+    y = "Count",
+    x = "Exited"
+  ) +
+  theme_minimal()
+```
+
+## Numerical features 
+
+The following insights were obtained from the numerical features:
+
+```{r plot-numeric-dist, echo = FALSE}
+df_long_q <- df_eda %>%
+  mutate(Exited = factor(Exited, levels = c("No", "Yes"))) %>%
+  pivot_longer(
+    cols = all_of(quant_vars),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+ggplot(df_long_q, aes(x = Exited, y = value, fill = Exited)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.8) +
+  facet_wrap(~ variable, ncol = 3, scales = "free_y") +   # 2 rows x 3 cols (for 5 vars)
+  scale_fill_manual(values = my_colors) +
+  labs(
+    title = "Distribution of numerical variables by Exited",
+    x = "Exited",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+```
+
+- **Customers aged** around 50 to 65 show a higher tendency to churn.
+
+- Interestingly, customers with a **zero account balance** appear less likely to churn. One possible explanation is that some of these accounts may be relatively inactive or used for specific purposes, so customers keep them open even without maintaining funds.
+
+- **Credit score** is a three-digit indicator commonly used in finance to reflect how likely a person is to repay their debts: the higher the score, the more creditworthy the customer is considered. In our data, churn increases mainly in the mid-range (roughly between 550 and 750), while customers at the extremes churn less often. This pattern is plausible, since very new customers may still have limited credit score history with the bank and are less likely to leave immediately after joining, whereas very high-score customers tend to be more financially stable and loyal.
+
+- **Estimated Salary** and **Points Earned** display an almost uniform distribution across churn classes, suggesting they may have limited standalone predictive power. The number of observations also declines at the extremes, which likely reflects fewer customers with very low or very high values.
+
+## Categorical features
+
+```{r plot-ordinal-dist, echo = FALSE}
+df_long_ord <- df_eda %>%
+  mutate(Exited = factor(Exited, levels = c("No", "Yes"))) %>%
+  pivot_longer(
+    cols = all_of(categorical_ord),
+    names_to = "variable",
+    values_to = "category"
+  ) %>%
+  mutate(category = factor(category))
+
+ggplot(df_long_ord, aes(x = category, fill = Exited)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ variable, ncol = 3, scales = "free_x") +   # 2 rows x 3 columns
+  scale_fill_manual(values = my_colors) +
+  labs(
+    title = "Distribution of ordinal categorical variables by Exited",
+    x = NULL,
+    y = "Count",
+    fill = "Exited"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 25, hjust = 1)
+  )
+```
+
+- The **Complain** feature appears to be an extremely strong indicator of churn. As shown in the bar plot, customers who have filed a complaint are overwhelmingly likely to churn (close to 99%), whereas customers with no recorded complaints mostly remain with the bank. This pattern is unusually strong and may indicate **data leakage**: the complaint information might have been recorded after the customer had already decided to leave or stay. To avoid introducing unrealistic predictive power into the model, we exclude Complain from the modelling stage.
+
+- **Credit card ownership** does not appear to meaningfully affect a customer’s likelihood of churn. As a result, marketing or retention strategies should not treat having a credit card as a key indicator when predicting customer attrition.
+
+- Customers that have **purchased more than 3 products** through the bank are usually more likely to churn. Actually, in our data there is nobody with 4 products that stay in the company.
+
+- **Satisfaction.Score** is not a feature that affects churn rate, the frequencies are almost the identical along the 5 different scores.
+
+- There is no clear trend between **tenure** and **churn**: for tenure levels 1–9, churn counts are fairly similar, suggesting a relatively stable churn propensity.
+
+```{r plot-nominal-dist, echo = FALSE}
+df_long <- df_eda %>%
+  mutate(Exited = factor(Exited, levels = c("No", "Yes"))) %>%
+  pivot_longer(
+    cols = all_of(categorical_nom),
+    names_to = "variable",
+    values_to = "category"
+  )
+
+ggplot(df_long, aes(x = category, fill = Exited)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ variable, ncol = 3, scales = "free_x") +   # 1 row, 3 columns
+  scale_fill_manual(values = my_colors) +
+  labs(
+    title = "Distribution of nominal categorical variables by Exited",
+    x = NULL,
+    y = "Count",
+    fill = "Exited"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 25, hjust = 1)
+  )
+```
+
+- **Card type** does not appear to be a strong driver of churn, as the churn/non-churn distributions are very similar across all card categories.
+
+- In our bank we have more male clients. However **females are slightly most likely to churn**.
+
+- Regarding **geography**, most customers are based in France. Germany stands out with a notably high churn rate (close to half of German customers), suggesting the bank should pay particular attention to retention in this market. In contrast, customers from Spain exhibit a lower churn tendency compared to the other countries.
+
+```{r load-model-data, echo = FALSE}
+df_raw <- read_csv("Customer-Churn-Records.csv") %>%
+  clean_names()
+
+df <- df_raw %>% 
+  # Remove identifiers 
+  dplyr::select(-any_of(c("row_number", "customer_id", "surname", "complain"))) %>% 
+  
+  # Convert variables to factors
+  mutate(
+    exited = factor(exited, levels = c(0, 1), labels = c("No", "Yes")),
+    geography = as.factor(geography),
+    gender    = as.factor(gender),
+    has_cr_card = factor(has_cr_card, levels = c(0,1), labels = c("No", "Yes")),
+    is_active_member = factor(is_active_member, levels = c(0,1), labels = c("No", "Yes"))
+  )
+```
+
+## Correlation scatterplot
+
+Overall, the correlation scatterplot suggests that most numeric features are weakly linearly related to each other and to the target, indicating low multicollinearity.
+
+The strongest association with Exited is **Age** (around 0.29), meaning older customers tend to churn slightly more in this dataset, while **Balance** shows a smaller positive correlation with churn (about 0.12). Among the predictors, the most notable relationship is the moderate negative correlation between **Balance** and **Number of products** (around −0.30), although it is not strong enough to be a major concern.
+
+```{r plot-correlation, echo = FALSE}
+# Select only numerical variables
+nums <- df %>% dplyr::select(where(is.numeric))
+numexit <- ifelse(df$exited == "Yes", 1, 0)
+nums <- nums %>% add_column(numexit)
+
+# Correlation matrix
+cor_matrix <- cor(nums, use = "complete.obs")
+
+# Plot
+ggcorrplot(cor_matrix,
+           method = "circle",
+           type = "lower",
+           lab = TRUE,             # Show the number
+           lab_size = 3,
+           colors = c("#FF3030", "white", "#9932CC"), # Diverging colors
+           title = "Correlation scatterplot",
+           ggtheme = theme_minimal())
+```
+
+# Resampling
+
+As we saw in the previous part, the dataset is moderately imbalanced. About 80% of customers did not churn and only 20% did, out of 10,000 observations. This means that churners, which are the class we are most interested in detecting, are underrepresented. When this happens, classification models may be biased towards the majority class. In other words, they can look acceptable in global terms while still missing too many actual churners.
+
+To reduce this problem, we applied two resampling methods: random oversampling and SMOTE. Random oversampling can help because it increases the presence of churners in the training set, making their patterns more visible to the model. In a dataset like ours, with a reasonably large sample size, duplicating minority observations can be a useful first step without losing information from the original data.
+
+SMOTE may be even more appropriate in this context, since churn is unlikely to be defined by a single very clear profile. Instead, it probably depends on combinations of features such as age, balance, activity level or geography. By generating synthetic minority observations based on existing churners, SMOTE can help create a broader and smoother representation of that class, instead of forcing the model to learn repeatedly from the exact same points.
+
+We tested both strategies to see whether they improved the performance of our probabilistic models, especially in terms of identifying churners.
+
+```{r train-test-split}
+# Train / Test Split (80/20) 
+trainIndex <- createDataPartition(df$exited, p = 0.8, list = FALSE)
+train_imb <- df[trainIndex, ]
+test_imb  <- df[-trainIndex, ]
+
+# Oversampling
+train_x <- train_imb %>% dplyr::select(-exited)
+train_y <- train_imb$exited
+train_up <- upSample(x = train_x, y = train_y, yname = "exited")
+
+# CV SMOTE
+ctrl_smote <- trainControl(method = "cv", number = 5, classProbs = TRUE, sampling = "smote")
+
+# CV Baseline
+ctrl_base <- trainControl(method = "cv", number = 5, classProbs = TRUE)
+```
+
+```{r train-lda}
+# ==========================================
+# LDA
+# ==========================================
+
+# Baseline Model (unbalanced)
+lda_base <- train(exited ~ ., data = train_imb, method = "lda", 
+                  trControl = ctrl_base)
+
+# Oversampling Model
+lda_up <- train(exited ~ ., data = train_up, method = "lda", 
+                trControl = ctrl_base)
+
+# SMOTE Model
+lda_smote <- train(exited ~ ., data = train_imb, method = "lda", 
+                   trControl = ctrl_smote)
+```
+
+```{r train-qda}
+# ==========================================
+# QDA
+# ==========================================
+
+# Baseline Model (unbalanced)
+qda_base <- train(exited ~ ., data = train_imb, method = "qda", 
+                  trControl = ctrl_base)
+
+# Oversampling Model
+qda_up <- train(exited ~ ., data = train_up, method = "qda", 
+                trControl = ctrl_base)
+
+# SMOTE Model
+qda_smote <- train(exited ~ ., data = train_imb, method = "qda", 
+                   trControl = ctrl_smote)
+```
+
+```{r plot-roc-function, echo=FALSE}
+# ==========================================
+# SELECTING THE BEST MODEL BY AUC (ROC)
+# ==========================================
+plot_roc_comparison <- function(model_list, test_data, true_labels, plot_title) {
+  
+  # Define consistent colors
+  colores <- c("steelblue", "forestgreen", "firebrick")
+  
+  # Vectors to store ROC objects and AUC values
+  roc_objects <- list()
+  auc_values <- c()
+  
+  # Loop through the model list (Base, Oversampling, SMOTE)
+  for (i in seq_along(model_list)) {
+    
+    probs <- predict(model_list[[i]], test_data, type = "prob")[, "Yes"]
+    
+    roc_obj <- roc(response = true_labels, predictor = probs, 
+                   levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+    
+    roc_objects[[i]] <- roc_obj
+    auc_values[i] <- round(auc(roc_obj), 3)
+    
+    # Plot. Create canvas for the first model, overlay others (add = TRUE)
+    if (i == 1) {
+      plot(roc_obj, col = colores[i], lwd = 2, main = plot_title, legacy.axes = TRUE)
+    } else {
+      plot(roc_obj, col = colores[i], lwd = 2, add = TRUE)
+    }
+  }
+  
+  # Add diagonal random guess line
+  abline(a = 0, b = 1, lty = 2, col = "gray50")
+  
+  # Dynamically build legend labels with model name and AUC
+  legend_labels <- paste(names(model_list), ": ", auc_values, sep = "")
+  
+  # Add legend to plot
+  legend("bottomright", legend = legend_labels, col = colores, lwd = 2)
+  
+  auc_results <- tibble(
+    Strategy = names(model_list),
+    AUC = auc_values
+  ) %>% arrange(desc(AUC)) # Sort by AUC descending
+  
+  return(auc_results)
+}
+
+lda_models <- list("No resampling" = lda_base, "Oversampling" = lda_up, "SMOTE" = lda_smote)
+qda_models <- list("No resampling" = qda_base, "Oversampling" = qda_up, "SMOTE" = qda_smote)
+
+auc_table_lda <- plot_roc_comparison(model_list = lda_models, test_data = test_imb, 
+                                     true_labels = test_imb$exited, plot_title = "LDA: ROC Comparison")
+
+auc_table_qda <- plot_roc_comparison(model_list = qda_models, test_data = test_imb, 
+                                     true_labels = test_imb$exited, plot_title = "QDA: ROC Comparison")
+
+knitr::kable(auc_table_lda, caption = "LDA: Explicit AUC Values")
+knitr::kable(auc_table_qda, caption = "QDA: Explicit AUC Values")
+```
+
+To select the single best model for our deep-dive analysis and cost optimization, we evaluate the models based on the Area Under the ROC Curve (AUC). Because the AUC is independent of any classification threshold, it serves as the purest measure of a model's intrinsic ability to separate churners from loyal customers.
+
+The ROC comparison shows that resampling has very little impact on AUC in our dataset. For LDA, SMOTE performs slightly better than the other two strategies, but the difference is almost negligible. For QDA, the best results are obtained without resampling, while SMOTE performs slightly worse.
+
+```{r train-logit}
+# ==========================================
+# Logistic Regression
+# ==========================================
+
+# Baseline
+logit_base <- train(exited ~ .,data = train_imb,method = "glm",
+                    family = binomial(), trControl = ctrl_base)
+
+# Oversampling
+logit_up <- train(exited ~ ., data = train_up, method = "glm",
+                  family = binomial(), trControl = ctrl_base)
+
+# SMOTE
+logit_smote <- train(exited ~ ., data = train_imb, method = "glm",
+                     family = binomial(), trControl = ctrl_smote)
+```
+
+```{r train-naive-bayes}
+# ==========================================
+# Naive Bayes
+# ==========================================
+
+nb_base <- train(exited ~ ., data = train_imb, method = "naive_bayes",
+               trControl = ctrl_base)
+
+nb_up <- train(exited ~ ., data = train_up, method = "naive_bayes",
+               trControl = ctrl_base)
+
+nb_smote <- train(exited ~ ., data = train_up, method = "naive_bayes",
+               trControl = ctrl_smote)
+```
+
+```{r logit-nb-roc, echo = FALSE}
+logit_models <- list("No resampling" = logit_base, "Oversampling" = logit_up, "SMOTE" = logit_smote)
+nb_models <- list("No resampling" = nb_base, "Oversampling" = nb_up, "SMOTE" = nb_smote)
+
+auc_table_logit <- plot_roc_comparison(model_list = logit_models, test_data = test_imb, 
+                                     true_labels = test_imb$exited, plot_title = "Logistic Regression: ROC Comparison")
+
+auc_table_nb <- plot_roc_comparison(model_list = nb_models, test_data = test_imb, 
+                                     true_labels = test_imb$exited, plot_title = "Naive-Bayes: ROC Comparison")
+
+knitr::kable(auc_table_logit, caption = "Logistic Regression: Explicit AUC Values")
+knitr::kable(auc_table_nb, caption = "Naive-Bayes: Explicit AUC Values")
+```
+
+Based on the AUC values reported for the logistic regression model, the three resampling strategies have little to no impact on overall ranking performance. We therefore proceed with the SMOTE logistic model (AUC = 0.779) and focus on selecting an appropriate decision threshold to capture as many potential churners as possible, prioritizing recall.
+
+Applying the same evaluation to the Naive Bayes model, we observe a modest improvement in AUC when using resampling methods. The baseline model without resampling achieves an AUC of 0.793, whereas both Oversampling and SMOTE reach approximately 0.83, suggesting that handling class imbalance is beneficial in this case. In this case, we will proceed with oversampling.
+
+For each probabilistic classifier, we have selected the resampling strategy that yields the highest AUC. The resulting best version of each model will be examined in greater detail in the following sections.
+
+---
+
+# Evaluation metrics and threshold analysis
+
+## Evaluation metrics
+
+Before analysing each probabilistic classifier in detail, it is useful to establish a common evaluation framework. Since our dataset is moderately imbalanced, standard **accuracy** is not enough to assess model quality on its own. A model may classify the majority class well and still fail to identify enough churners, which are precisely the customers we are most interested in detecting.
+
+For this reason, we evaluate the models using several complementary metrics. **Sensitivity** is especially important, since it measures the ability to correctly detect churners. We also consider **Specificity**, **Precision** and **F1-score**, as they provide additional information about the trade-off between identifying churners and avoiding unnecessary interventions on loyal customers.
+
+## Threshold
+
+However, model ranking is only part of the problem. In practice, churn prediction requires a final classification rule, and this depends on the probability threshold used to convert predicted probabilities into class labels. The default threshold of 0.5 is not necessarily appropriate in our setting, because the costs of the two types of classification errors are not the same. In our business formulation, a false negative (failing to identify a churner) has a cost of 100, whereas a false positive (incorrectly flagging a loyal customer) has a cost of 10.
+
+Under this asymmetric cost structure, we are willing to accept more false positives if this helps reduce the number of missed churners. For that reason, we evaluate not only the default threshold, but also a **cost-sensitive threshold** based on the relative error costs. If posterior probabilities were perfectly calibrated, the theoretical threshold would be:
+
+$$t^* = \frac{C_{FP}}{C_{FP} + C_{FN}} = \frac{10}{10 + 100} = 0.091$$
+
+This suggests that customers with a predicted churn probability above roughly 9% should already be classified as potential churners.
+
+In addition, we perform an empirical threshold sweep to analyse how the main metrics and the Expected Cost change as the threshold varies. This helps us determine the most suitable operating point for each classifier.
+
+```{r evaluate-model-function, echo = FALSE}
+evaluate_model <- function(model_fit, test_data, true_labels, threshold) {
+  
+  probs <- predict(model_fit, test_data, type = "prob")[, "Yes"]
+  preds <- factor(ifelse(probs >= threshold, "Yes", "No"), levels = c("No", "Yes"))
+  
+  cm <- confusionMatrix(preds, true_labels, positive = "Yes")
+  
+  # Expected Cost Calculation (FN = 100, FP = 10)
+  fn <- sum(preds == "No"  & true_labels == "Yes")
+  fp <- sum(preds == "Yes" & true_labels == "No")
+  exp_cost <- (fn * 100 + fp * 10) / length(true_labels)
+  
+  roc_obj <- roc(response = true_labels, predictor = probs, quiet = TRUE)
+  
+  tibble(
+    AUC           = as.numeric(auc(roc_obj)),
+    Accuracy      = cm$overall["Accuracy"],
+    Sensitivity   = cm$byClass["Sensitivity"],
+    Specificity   = cm$byClass["Specificity"],
+    Precision     = cm$byClass["Precision"],
+    F1_Score      = cm$byClass["F1"],
+    Expected_Cost = exp_cost
+  )
+}
+```
+
+# Logit with SMOTE
+
+One of the main advantages of logistic regression is the interpretability of its results, particularly through the estimated coefficients. In our case, we provide a brief analysis of the SMOTE model. It is worth noting that the most significant variables are largely the same across the three models, the only differences arise for EstimatedSalary and Card Type.
+
+In particular, the sign of each coefficient indicates whether a predictor increases or decreases the probability of Exited = 1, holding all other variables constant. For instance, the positive coefficients for Age and Balance suggest that older customers and those with higher account balances are more likely to leave the bank. In contrast, the negative coefficient for Gender (Male) indicates that male customers have a lower likelihood of churn than female customers.
+
+```{r logit-summary}
+summary(logit_smote)
+```
+
+We can also interpret the **odds-ratio** (OR), which quantifies how a predictor changes the odds of churn $p/(1-p)$, holding all other variables constant, remark that it is not the same as probability. Some important insights:
+
+- **Strongest churn drivers**: Age is the most influential predictor (≈ OR 1.09 per additional year, i.e., churn odds rise with age). Customers in Germany have substantially higher churn than those in France (≈ OR 2.28).
+
+- **Strongest protective factors**: Being an active member is associated with a large reduction in churn (≈ OR 0.34), and male customers show lower churn odds than female customers (≈ OR 0.55).
+
+- **Moderate but significant effects**: Higher balance slightly increases churn odds, while longer tenure (≈ OR 0.98 per unit) and having more products (≈ OR 0.91 per additional product) are associated with lower churn. Credit score has a small protective effect (≈ OR 0.95 per +100 points), and both having a credit card (≈ OR 0.90) and holding a GOLD card (≈ OR 0.86 vs the reference card type) are associated with slightly lower churn odds.
+
+Notice that the obtained results are consistent with the patterns observed in the EDA.
+
+## Logit Predictions and Evaluation
+
+We now evaluate the predictive performance of our best Logistic model on the unseen test set. Following the common evaluation framework introduced earlier, we first examine its behaviour under the default classification threshold of 0.5, and then compare it with cost-sensitive alternatives
+
+```{r logit-threshold-eval, echo = FALSE}
+# ==========================================
+# LOGIT: THRESHOLD STRATEGY EVALUATION
+# ==========================================
+library(purrr)
+
+scenarios_logit <- tibble(
+  Strategy_Name = c("SMOTE (Default 0.5)", 
+                    "SMOTE (Cost-Sens 0.09)"),
+  Model_Fit     = list(logit_smote, logit_smote), 
+  Threshold     = c(0.5, 0.09)
+)
+
+logit_results <- pmap_dfr(scenarios_logit, function(Strategy_Name, Model_Fit, Threshold) {
+  res <- evaluate_model(model_fit = Model_Fit, test_data = test_imb, 
+                        true_labels = test_imb$exited, threshold = Threshold)
+  res %>% mutate(Strategy = Strategy_Name, Applied_Threshold = Threshold, .before = 1)
+})
+
+knitr::kable(logit_results, digits = 3, 
+             caption = "Logit: Threshold Strategy Comparison")
+```
+
+Using the default threshold, the model correctly classifies 72% of customers overall, identifying 70% of true churners (sensitivity) while correctly recognizing 72.8% of non-churners (specificity).
+
+Lowering the decision threshold from 0.50 to 0.09 drastically changes the model’s behaviour. Sensitivity increases from 0.7 to 0.998, meaning that almost all churners are detected. However, this comes at the expense of a severe drop in specificity, from 0.728 to 0.046, so a large number of loyal customers are incorrectly flagged as churners.
+
+As a consequence, accuracy deteriorates sharply lowers from 0.723 to 0.24, and precision also declines from 0.398 to 0.212, leading to a lower F1-score equal to 0.348. Importantly, the AUC remains unchanged, since it reflects ranking performance and is not affected by the choice of threshold. Nevertheless, the expected cost decreases from 8.2 to 7.6, indicating that in our business setting the default threshold of 0.5 is too conservative: a more aggressive rule can be preferable when missing a churner is substantially more costly than wrongly targeting a non-churner.
+
+```{r logit-threshold-opt, echo=FALSE}
+# ==========================================
+# THRESHOLD OPTIMIZATION (LOGIT SMOTE)
+# ==========================================
+# Extract probabilities from our best SMOTE model
+probs_logit_opt <- predict(logit_smote, test_imb, type = "prob")[, "Yes"]
+
+thresholds_logit <- seq(0.05, 0.95, by = 0.05)
+results_thresh_logit <- data.frame()
+
+for (thresh in thresholds_logit) {
+  preds <- factor(ifelse(probs_logit_opt >= thresh, "Yes", "No"), levels = c("No", "Yes"))
+  cm <- confusionMatrix(preds, test_imb$exited, positive = "Yes")
+  
+  fn <- sum(preds == "No"  & test_imb$exited == "Yes")
+  fp <- sum(preds == "Yes" & test_imb$exited == "No")
+  exp_cost <- (fn * 100 + fp * 10) / length(test_imb$exited)
+  
+  results_thresh_logit <- rbind(results_thresh_logit, data.frame(
+    Threshold = thresh,
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    Expected_Cost = exp_cost
+  ))
+}
+
+# Find the threshold that yields the minimum cost
+opt_row_logit <- results_thresh_logit[which.min(results_thresh_logit$Expected_Cost), ]
+opt_thresh_logit <- opt_row_logit$Threshold
+min_cost_logit <- opt_row_logit$Expected_Cost
+
+# Visualizing the Threshold Sweep for Logit
+ggplot(results_thresh_logit, aes(x = Threshold)) +
+  geom_line(aes(y = Sensitivity, color = "Sensitivity"), linewidth = 1) +
+  geom_line(aes(y = Specificity, color = "Specificity"), linewidth = 1) +
+  geom_line(aes(y = Expected_Cost / max(Expected_Cost), color = "Expected Cost (Scaled)"), 
+            linewidth = 1, linetype = "dashed") +
+  geom_vline(xintercept = opt_thresh_logit, linetype = "dotted", color = "red") +
+  annotate("text", x = opt_thresh_logit + 0.05, y = 0.5, 
+           label = paste("Optimal:\n", opt_thresh_logit), color = "red") +
+  labs(title = paste("Logit (SMOTE): Threshold Optimization (Min Cost:", round(min_cost_logit, 2), ")"),
+       x = "Probability Threshold", y = "Metric Value / Scaled Cost", color = "Metric") +
+  theme_minimal() +
+  scale_color_manual(values = c("Sensitivity" = "steelblue", 
+                                "Specificity" = "forestgreen", 
+                                "Expected Cost (Scaled)" = "firebrick"))
+```
+
+The results show that the minimum expected cost is reached at a threshold of approximately 0.30, with a value close to 6.6, which is substantially lower than the cost obtained at both 0.5 and 0.09. Which means this optimal threshold might be a better value to balance churn detection against excessive false positives.
+
+# Naive Bayes with oversampling
+
+Naive Bayes relies on a conditional independence assumption that often does not hold in practice. However, our correlation analysis suggests that the predictors are only weakly correlated, meaning this assumption may be approximately satisfied in our setting, which could partly explain the model’s strong performance.
+
+## Naive Predictions and Evaluation
+
+```{r nb-threshold-eval, echo=FALSE}
+# ==========================================
+# NAIVE: THRESHOLD STRATEGY EVALUATION
+# ==========================================
+library(purrr)
+
+scenarios_nb <- tibble(
+  Strategy_Name = c("Oversampling (Default 0.5)", 
+                    "Oversampling (Cost-Sens 0.09)"),
+  Model_Fit     = list(nb_up, nb_up), 
+  Threshold     = c(0.5, 0.09)
+)
+
+nb_results <- pmap_dfr(scenarios_nb, function(Strategy_Name, Model_Fit, Threshold) {
+  res <- evaluate_model(model_fit = Model_Fit, test_data = test_imb, 
+                        true_labels = test_imb$exited, threshold = Threshold)
+  res %>% mutate(Strategy = Strategy_Name, Applied_Threshold = Threshold, .before = 1)
+})
+
+knitr::kable(nb_results, digits = 3, 
+             caption = "Naive bayes: Threshold Strategy Comparison")
+```
+
+Reducing the threshold from 0.50 to 0.09 makes the Naive Bayes classifier much more aggressive: sensitivity rises from 0.661 to 0.961, but specificity falls from 0.847 to 0.308, meaning many more non-churners are flagged. As a result, accuracy and precision decline from 0.809 to 0.441 and from 0.525 to 0.262, respectively, and the F1-score drops from 0.585 to 0.412. The AUC remains unchanged at 0.839 because it is threshold-independent. Despite these trade-offs, the expected cost improves substantially, decreasing from 8.119 to 6.313, which supports using a lower threshold in our cost-sensitive setting.
+
+```{r nb-threshold-opt, echo=FALSE}
+# ==========================================
+# THRESHOLD OPTIMIZATION (NAIVE UP)
+# ==========================================
+# Extract probabilities from our best Up model
+probs_nb_opt <- predict(nb_up, test_imb, type = "prob")[, "Yes"]
+
+thresholds_nb <- seq(0.05, 0.95, by = 0.05)
+results_thresh_nb <- data.frame()
+
+for (thresh in thresholds_nb) {
+  preds <- factor(ifelse(probs_nb_opt >= thresh, "Yes", "No"), levels = c("No", "Yes"))
+  cm <- confusionMatrix(preds, test_imb$exited, positive = "Yes")
+  
+  fn <- sum(preds == "No"  & test_imb$exited == "Yes")
+  fp <- sum(preds == "Yes" & test_imb$exited == "No")
+  exp_cost <- (fn * 100 + fp * 10) / length(test_imb$exited)
+  
+  results_thresh_nb <- rbind(results_thresh_nb, data.frame(
+    Threshold = thresh,
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    Expected_Cost = exp_cost
+  ))
+}
+
+# Find the threshold that yields the minimum cost
+opt_row_nb <- results_thresh_nb[which.min(results_thresh_nb$Expected_Cost), ]
+opt_thresh_nb <- opt_row_nb$Threshold
+min_cost_nb <- opt_row_nb$Expected_Cost
+
+# Visualizing the Threshold Sweep for Naive Bayes
+ggplot(results_thresh_nb, aes(x = Threshold)) +
+  geom_line(aes(y = Sensitivity, color = "Sensitivity"), linewidth = 1) +
+  geom_line(aes(y = Specificity, color = "Specificity"), linewidth = 1) +
+  geom_line(aes(y = Expected_Cost / max(Expected_Cost), color = "Expected Cost (Scaled)"), 
+            linewidth = 1, linetype = "dashed") +
+  geom_vline(xintercept = opt_thresh_nb, linetype = "dotted", color = "red") +
+  annotate("text", x = opt_thresh_nb + 0.05, y = 0.5, 
+           label = paste("Optimal:\n", opt_thresh_nb), color = "red") +
+  labs(title = paste("Naive Bayes Oversampling: Threshold Optimization (Min Cost:", round(min_cost_nb, 2), ")"),
+       x = "Probability Threshold", y = "Metric Value / Scaled Cost", color = "Metric") +
+  theme_minimal() +
+  scale_color_manual(values = c("Sensitivity" = "steelblue", 
+                                "Specificity" = "forestgreen", 
+                                "Expected Cost (Scaled)" = "firebrick"))
+```
+
+In this case, the theoretical optimal threshold is much closer to the empirical optimum we identified than in the logistic regression model and it also obtains a lowest minimum cost too.
+
+# LDA with SMOTE
+
+LDA tries to separate churners and non-churners by finding a linear combination of the predictors that best distinguishes the two classes.
+
+```{r lda-prior, echo=FALSE}
+final_lda <- lda_smote$finalModel
+
+cat("Prior Probabilities (SMOTE Training):\n")   # reflect the proportion of each class in the training data
+print(final_lda$prior)
+```
+
+Since SMOTE balances the minority and majority classes during training, the fitted LDA model uses approximately equal prior probabilities for churners and non-churners. This encourages the classifier to pay more attention to the minority class than it would under the original 80/20 imbalance.
+
+```{r lda-means, echo=FALSE}
+# Group means (Average profile of loyal vs churned customers)
+cat("\nGroup Means:\n") 
+print(final_lda$means)
+```
+
+The group means allow us to identify a general customer profile for each class. Rather than being explained by a single variable, churn seems to be associated with a combination of characteristics. For example, customers who leave the bank tend to be older, less active, and to hold higher balances on average.
+
+```{r lda-scaling, echo=FALSE}
+# Linear discriminant coefficients
+cat("\nLinear Discriminant Coefficients:\n")
+print(final_lda$scaling) # define the linear discriminant function
+```
+
+The signs of the discriminant coefficients are informative about the direction of separation. In particular, being an active member pushes observations towards the non-churn side, while higher age and being located in Germany push them towards the churn side. However, coefficient magnitudes should be interpreted cautiously, since the predictors are measured on different scales.
+
+```{r lda-visualization, echo=FALSE}
+# ==========================================
+# VISUALISING LDA
+# ==========================================
+
+# Project the original training data onto the linear discriminant axis
+# 1) Create design matrix with the same dummies used by the model
+x_train_mat <- model.matrix(exited ~ ., data = train_imb)[, -1] %>% as.data.frame()
+
+# 2) Keep only the columns the model expects
+expected_cols <- rownames(final_lda$scaling)
+x_train_mat <- x_train_mat[, expected_cols, drop = FALSE]
+
+# 3) Project data onto the discriminant
+lda_values <- predict(final_lda, newdata = x_train_mat)
+
+# 4) Data frame for visualization
+lda_viz <- data.frame(
+  LD1 = lda_values$x[, 1],
+  Exited = train_imb$exited
+)
+
+ggplot(lda_viz, aes(x = LD1, fill = Exited)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "LDA (SMOTE): Projection onto Linear Discriminant",
+       subtitle = "Separation between classes on the discriminant axis",
+       x = "Linear Discriminant 1 (LD1)", y = "Density") +
+  theme_minimal() +
+  scale_fill_manual(values = c("No" = "#69b3a2", "Yes" = "#F4D03F"))
+```
+
+The projection of the original training data onto the first linear discriminant confirms that the model captures a meaningful separation between the two classes. Churners tend to have larger values of the discriminant score, whereas non-churners are more concentrated on the left-hand side. However, the overlap between both distributions is still substantial, which indicates that the separation is only partial. This is consistent with the moderate AUC obtained for LDA: the model identifies relevant structure, but the two classes remain far from perfectly separable.
+
+## LDA Predictions and Evaluation
+
+We now evaluate the predictive performance of our best LDA model (`lda_smote`) on the unseen test set. Following the common evaluation framework introduced earlier, we first examine its behaviour under the default classification threshold of 0.5, and then compare it with cost-sensitive alternatives.
+
+```{r lda-threshold-eval, echo=FALSE}
+library(purrr)
+
+scenarios_lda <- tibble(
+  Strategy_Name = c("SMOTE (Default 0.5)",
+                    "SMOTE (Cost-Sens 0.09)"),
+  Model_Fit     = list(lda_smote, lda_smote), 
+  Threshold     = c(0.5, 0.09)
+)
+
+lda_results <- pmap_dfr(scenarios_lda, function(Strategy_Name, Model_Fit, Threshold) {
+  res <- evaluate_model(model_fit = Model_Fit, test_data = test_imb, 
+                        true_labels = test_imb$exited, threshold = Threshold)
+  res %>% mutate(Strategy = Strategy_Name, Applied_Threshold = Threshold, .before = 1)
+})
+
+knitr::kable(lda_results, digits = 3, 
+             caption = "LDA: Threshold Strategy Comparison")
+```
+
+Using the default threshold, the model achieves an accuracy of 0.724, with sensitivity = 0.703 and specificity = 0.729. This indicates a relatively balanced classification behaviour: the model correctly identifies around 70% of churners while maintaining a similar ability to recognize non-churners.
+
+Lowering the threshold from 0.5 to 0.09 radically changes the model’s behaviour. Sensitivity increases from 0.703 to 0.998, meaning that almost all churners are detected. However, this comes at the cost of an extreme drop in specificity, from 0.729 to 0.056, so a very large number of loyal customers are incorrectly flagged as churners.
+
+As a result, accuracy deteriorates sharply. Nevertheless, the expected cost decreases from 8.209 to 7.569. This confirms that, in our business setting, the default threshold of 0.5 is too conservative: even a much more aggressive classification rule can be preferable when missing a churner is far more costly than wrongly targeting a loyal customer.
+
+---
+
+Although the theoretical threshold of 0.09 improves the expected cost relative to the default rule, it is not the most effective practical choice for this model. Because SMOTE alters the class balance during training, the resulting posterior probabilities may not be perfectly aligned with the original data distribution. For that reason, we perform an empirical threshold sweep on the test set in order to study how sensitivity, specificity and expected cost evolve across different operating points.
+
+```{r lda-threshold-opt, echo=FALSE}
+# ==========================================
+# THRESHOLD OPTIMIZATION  
+# ==========================================
+# Extract probabilities from our best LDA model
+probs_lda <- predict(lda_smote, test_imb, type = "prob")[, "Yes"]
+
+thresholds <- seq(0.05, 0.95, by = 0.05)
+results_thresh_lda <- data.frame()
+
+for (thresh in thresholds) {
+  preds <- factor(ifelse(probs_lda >= thresh, "Yes", "No"), levels = c("No", "Yes"))
+  cm <- confusionMatrix(preds, test_imb$exited, positive = "Yes")
+  
+  fn <- sum(preds == "No"  & test_imb$exited == "Yes")
+  fp <- sum(preds == "Yes" & test_imb$exited == "No")
+  exp_cost <- (fn * 100 + fp * 10) / length(test_imb$exited)
+  
+  results_thresh_lda <- rbind(results_thresh_lda, data.frame(
+    Threshold = thresh,
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    Expected_Cost = exp_cost
+  ))
+}
+
+# Find the threshold that yields the minimum cost
+opt_row_lda <- results_thresh_lda[which.min(results_thresh_lda$Expected_Cost), ]
+opt_thresh_lda <- opt_row_lda$Threshold
+min_cost_lda <- opt_row_lda$Expected_Cost
+
+# Visualizing the Threshold Sweep for LDA
+ggplot(results_thresh_lda, aes(x = Threshold)) +
+  geom_line(aes(y = Sensitivity, color = "Sensitivity"), linewidth = 1) +
+  geom_line(aes(y = Specificity, color = "Specificity"), linewidth = 1) +
+  geom_line(aes(y = Expected_Cost / max(Expected_Cost), color = "Expected Cost (Scaled)"), 
+            linewidth = 1, linetype = "dashed") +
+  geom_vline(xintercept = opt_thresh_lda, linetype = "dotted", color = "red") +
+  annotate("text", x = opt_thresh_lda + 0.05, y = 0.5, 
+           label = paste("Optimal:\n", opt_thresh_lda), color = "red") +
+  labs(title = paste("LDA (SMOTE): Threshold Optimization (Min Cost:", round(min_cost_lda, 2), ")"),
+       x = "Probability Threshold", y = "Metric Value / Scaled Cost", color = "Metric") +
+  theme_minimal() +
+  scale_color_manual(values = c("Sensitivity" = "steelblue", 
+                                "Specificity" = "forestgreen", 
+                                "Expected Cost (Scaled)" = "firebrick"))
+```
+
+The results show that the minimum expected cost is reached at a threshold of approximately 0.30, with a value close to 6.6, which is substantially lower than the cost obtained at both 0.5 and 0.09. This indicates that the best operational rule for this model is neither the default threshold nor the purely theoretical cost-based one, but an intermediate value that better balances churn detection against excessive false positives.
+
+Overall, the LDA results reinforce an important point of our analysis: in an imbalanced churn problem with asymmetric business costs, threshold choice can be as important as model choice itself.
+
+# QDA with No Resampling
+
+Among the QDA variants considered, the model trained on the original imbalanced data achieved the best AUC overall. We therefore retain this specification as the representative QDA model for a more detailed analysis.
+
+Quadratic Discriminant Analysis extends LDA by allowing each class to have its own covariance matrix, which leads to a more flexible, nonlinear decision rule. In our dataset, this flexibility appears to be useful, as the separation between churners and non-churners is unlikely to be fully captured by a single linear boundary.
+
+```{r qda-prior, echo=FALSE}
+final_qda <- qda_base$finalModel
+
+# Prior probabilities (Reflects the true imbalanced nature of the data)
+cat("Prior Probabilities (Original Data):\n")
+print(final_qda$prior)
+```
+
+Since this model is trained on the original data, its prior probabilities reflect the actual imbalance in the sample.
+
+```{r qda-means, echo=FALSE}
+# Group means
+cat("\nGroup Means:\n")
+print(final_qda$means)
+```
+
+The group means again suggest that churn is associated with a broader customer profile rather than with one single predictor in isolation: churners tend to be older, less active, and to hold higher balances on average.
+
+Unlike LDA, QDA does not produce a single vector of linear discriminant coefficients, since the classification rule is quadratic rather than linear.
+
+## QDA Predictions and Evaluation
+
+```{r qda-threshold-eval, echo=FALSE}
+# ==========================================
+# QDA: THRESHOLD STRATEGY EVALUATION
+# ==========================================
+library(purrr)
+
+scenarios_qda <- tibble(
+  Strategy_Name = c("No Resampling (Default 0.5)", 
+                    "No Resampling (Cost-Sens 0.09)"),
+  Model_Fit     = list(qda_base, qda_base), 
+  Threshold     = c(0.5, 0.09)
+)
+
+qda_results <- pmap_dfr(scenarios_qda, function(Strategy_Name, Model_Fit, Threshold) {
+  res <- evaluate_model(model_fit = Model_Fit, test_data = test_imb, 
+                        true_labels = test_imb$exited, threshold = Threshold)
+  res %>% mutate(Strategy = Strategy_Name, Applied_Threshold = Threshold, .before = 1)
+})
+
+knitr::kable(qda_results, digits = 3, 
+             caption = "QDA: Threshold Strategy Comparison")
+```
+
+Under the default threshold of 0.5, QDA achieves a high overall accuracy and an excellent specificity, meaning that it is very effective at recognizing loyal customers. It also attains a relatively high precision, so customers flagged as churners are often true positives. However, sensitivity is low: the model identifies only around one third of actual churners. From a business perspective, this is problematic, since false negatives are the most costly type of error in our setting.
+
+Lowering the threshold from 0.5 to 0.09 dramatically improves the model’s usefulness in our churn setting. Sensitivity rises from 0.354 to 0.894, so the model is now able to detect the vast majority of churners. Although specificity decreases from 0.955 to 0.535, this loss is more than compensated by the substantial reduction in false negatives.
+
+As a result, the expected cost falls sharply from 13.512 to 5.853. This confirms that the default threshold of 0.5 is far too conservative for QDA in our problem, and that a cost-sensitive threshold leads to a much more appropriate operational behaviour.
+
+```{r qda-threshold-opt, echo=FALSE}
+# ==========================================
+# THRESHOLD OPTIMIZATION (QDA No Resampling)
+# ==========================================
+# Extract probabilities from our best QDA model
+probs_qda_opt <- predict(qda_base, test_imb, type = "prob")[, "Yes"]
+
+thresholds_qda <- seq(0.05, 0.95, by = 0.05)
+results_thresh_qda <- data.frame()
+
+for (thresh in thresholds_qda) {
+  preds <- factor(ifelse(probs_qda_opt >= thresh, "Yes", "No"), levels = c("No", "Yes"))
+  cm <- confusionMatrix(preds, test_imb$exited, positive = "Yes")
+  
+  fn <- sum(preds == "No"  & test_imb$exited == "Yes")
+  fp <- sum(preds == "Yes" & test_imb$exited == "No")
+  exp_cost <- (fn * 100 + fp * 10) / length(test_imb$exited)
+  
+  results_thresh_qda <- rbind(results_thresh_qda, data.frame(
+    Threshold = thresh,
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    Expected_Cost = exp_cost
+  ))
+}
+
+# Find the threshold that yields the minimum cost
+opt_row_qda <- results_thresh_qda[which.min(results_thresh_qda$Expected_Cost), ]
+opt_thresh_qda <- opt_row_qda$Threshold
+min_cost_qda <- opt_row_qda$Expected_Cost
+
+# Visualizing the Threshold Sweep for QDA
+ggplot(results_thresh_qda, aes(x = Threshold)) +
+  geom_line(aes(y = Sensitivity, color = "Sensitivity"), linewidth = 1) +
+  geom_line(aes(y = Specificity, color = "Specificity"), linewidth = 1) +
+  geom_line(aes(y = Expected_Cost / max(Expected_Cost), color = "Expected Cost (Scaled)"), 
+            linewidth = 1, linetype = "dashed") +
+  geom_vline(xintercept = opt_thresh_qda, linetype = "dotted", color = "red") +
+  annotate("text", x = opt_thresh_qda + 0.05, y = 0.5, 
+           label = paste("Optimal:\n", opt_thresh_qda), color = "red") +
+  labs(title = paste("QDA (No Resampling): Threshold Optimization (Min Cost:", round(min_cost_qda, 2), ")"),
+       x = "Probability Threshold", y = "Metric Value / Scaled Cost", color = "Metric") +
+  theme_minimal() +
+  scale_color_manual(values = c("Sensitivity" = "steelblue", 
+                                "Specificity" = "forestgreen", 
+                                "Expected Cost (Scaled)" = "firebrick"))
+```
+
+The empirical threshold sweep confirms that the best operating point for QDA lies very close to the theoretical cost-sensitive threshold. The minimum expected cost is reached at approximately 0.10, which is almost identical to the theoretical value of 0.09 derived from the error costs. This indicates that, for QDA trained on the original data, the cost-based threshold rule is not only conceptually appropriate, but also highly effective in practice.
+
+## Visualizing Decision Boundaries: LDA vs QDA
+ 
+ To gain intuition about the difference between both classifiers, we visualize simplified 2D decision boundaries using age and balance, two relevant continuous predictors in our dataset. The plots show that the classes are heavily overlapped in this reduced feature space, so no clean separation is possible using only these variables.
+
+```{r decision-boundaries-2d, echo=FALSE}
+# ==========================================
+# DECISION BOUNDARIES (2D Visualization)
+# ==========================================
+
+# Fit simplified models for visualization purposes (using Age and Balance)
+lda_2d <- lda(exited ~ age + balance, data = train_imb)
+qda_2d <- qda(exited ~ age + balance, data = train_imb)
+
+# Create a grid
+x_range <- seq(min(train_imb$age), max(train_imb$age), length.out = 100)
+y_range <- seq(min(train_imb$balance), max(train_imb$balance), length.out = 100)
+grid <- expand.grid(age = x_range, balance = y_range)
+
+# Predictions on grid
+grid$LDA <- predict(lda_2d, grid)$class
+grid$QDA <- predict(qda_2d, grid)$class
+
+# Plot LDA
+p_lda <- ggplot() +
+  geom_tile(data = grid, aes(x = age, y = balance, fill = LDA), alpha = 0.3) +
+  geom_point(data = train_imb, aes(x = age, y = balance, color = exited),
+             alpha = 0.4, size = 0.5) +
+  labs(title = "LDA Boundary (Linear)", x = "Age", y = "Balance") +
+  theme_minimal() +
+  scale_fill_manual(values = c("No" = "#69b3a2", "Yes" = "#F4D03F")) +
+  scale_color_manual(values = c("No" = "#69b3a2", "Yes" = "#F4D03F")) +
+  theme(legend.position = "none")
+
+# Plot QDA
+p_qda <- ggplot() +
+  geom_tile(data = grid, aes(x = age, y = balance, fill = QDA), alpha = 0.3) +
+  geom_point(data = train_imb, aes(x = age, y = balance, color = exited),
+             alpha = 0.4, size = 0.5) +
+  labs(title = "QDA Boundary (Quadratic)", x = "Age", y = "Balance") +
+  theme_minimal() +
+  scale_fill_manual(values = c("No" = "#69b3a2", "Yes" = "#F4D03F")) +
+  scale_color_manual(values = c("No" = "#69b3a2", "Yes" = "#F4D03F"))
+
+# Display side by side (Requires the 'patchwork' library)
+p_lda + p_qda
+```
+
+Even so, the QDA boundary is more flexible than the linear boundary produced by LDA. This reflects the key difference between both methods: while LDA imposes a single common covariance structure and therefore a linear separation rule, QDA allows for class-specific covariance matrices, which results in a nonlinear decision boundary.
+
+Although this visualization is only illustrative and based on two predictors, it is consistent with the empirical results: the additional flexibility of QDA appears to better accommodate the structure of the churn data.
+
+# Comparative evaluation
+
+```{r comparative-evaluation, echo=FALSE}
+# Add model name to each table
+lda_comp <- lda_results %>% mutate(Model = "LDA", .before = 1)
+qda_comp <- qda_results %>% mutate(Model = "QDA", .before = 1)
+
+logit_comp <- logit_results %>% mutate(Model = "Logit", .before = 1)
+nb_comp    <- nb_results    %>% mutate(Model = "Naive Bayes", .before = 1)
+
+# Combine available models
+comparison_results <- bind_rows(
+  lda_comp,
+  qda_comp,
+  logit_comp,
+  nb_comp
+) %>%
+  dplyr::select(Model, Strategy, Applied_Threshold, AUC, Accuracy, Sensitivity,
+                Specificity, Precision, F1_Score, Expected_Cost) %>%
+  dplyr::arrange(Expected_Cost)
+
+knitr::kable(
+  comparison_results,
+  digits = 3,
+  caption = "Comparative evaluation of probabilistic models under different thresholds"
+)
+
+# ==========================================
+# BEST CONFIGURATION PER MODEL
+# ==========================================
+
+best_by_model <- comparison_results %>%
+  group_by(Model) %>%
+  slice_min(order_by = Expected_Cost, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::arrange(Expected_Cost)
+
+knitr::kable(
+  best_by_model,
+  digits = 3,
+  caption = "Best threshold configuration for each probabilistic model"
+)
+```
+
+We recommend selecting **QDA without resampling** using the $t^* = 0.09$, as it provides the best performance under our business objective. In particular, QDA achieves the lowest expected cost among all probabilistic models, which is the key criterion given that misclassifying a true churner is substantially more expensive than incorrectly flagging a loyal customer.
+
+Moreover, QDA maintains a strong ability to identify churners (recall), while preserving a noticeably higher capacity to correctly classify non-churners, i.e specificity = 0.535 compared to the SMOTE-based alternatives. In contrast, LDA and Logit reach near-perfect sensitivity but at the expense of extremely low specificity, effectively labelling most customers as churners and inflating the number of false positives and retention interventions.
+
+Finally, QDA also offers the most balanced overall predictive performance, achieving the highest F1-score in the comparison, while relying on a simpler modelling setup that does not require resampling.
